@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp"
+    tools:context=".MainActivity">
+
+    <!-- 1️⃣ HTTPS 测试图 -->
+    <ImageView
+        android:id="@+id/iv_test_https"
+        android:layout_width="200dp"
+        android:layout_height="200dp"
+        android:layout_gravity="center_horizontal"/>
+
+    <!-- 2️⃣ 原图（未加密） -->
+    <ImageView
+        android:id="@+id/iv_original"
+        android:layout_width="200dp"
+        android:layout_height="200dp"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginTop="16dp"/>
+
+    <!-- 3️⃣ AES 加密图（✅ 带水印容器） -->
+    <FrameLayout
+        android:id="@+id/image_container"
+        android:layout_width="200dp"
+        android:layout_height="200dp"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginTop="16dp">
+
+        <ImageView
+            android:id="@+id/iv_aes"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"/>
+
+        <!-- ✅ 水印 View（无 GPU 风险） -->
+        <com.example.glidehelper.WatermarkOverlayView
+            android:id="@+id/watermark_view"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"/>
+    </FrameLayout>
+
+</LinearLayout>
