@@ -5,22 +5,17 @@ import android.widget.ImageView;
 
 import androidx.annotation.NonNull;
 
-import java.util.concurrent.atomic.AtomicBoolean;
-
 /**
  * ====================================================
  * ImageLoader
  * ----------------------------------------------------
- * ✅ 对外唯一入口
- * ✅ 普通图 / AES 图统一加载
- *
- * ✅ 使用范例：
- *
+ * 对外唯一入口
+ * 普通图 / AES 图统一加载
+ * 使用范例：
  * ImageLoader.with(context)
  *         .load(url, imageView, option);
- *
  * ImageLoader.with(context)
- *         .loadAes(url, imageView, option, aesOption);
+ *         .loadAesBitmap(url, imageView, option, aesOption);
  * ====================================================
  */
 public class ImageLoader {
@@ -30,9 +25,6 @@ public class ImageLoader {
 
     /** 应用上下文 */
     private final Context context;
-
-    /** 防止重复加载 */
-    private final AtomicBoolean loading = new AtomicBoolean(false);
 
     /**
      * 私有构造
@@ -56,20 +48,20 @@ public class ImageLoader {
     }
 
     /**
-     * ✅ 加载普通图（支持 Cookie Header）
+     * 加载普通图（支持 Cookie Header）
+     * [FIX] 移除 AtomicBoolean，避免全局阻塞图片加载
      */
     public void load(
             @NonNull String url,
             @NonNull ImageView imageView,
             @NonNull LoadOption option
     ) {
-        if (!loading.compareAndSet(false, true)) return;
         LoadExecutor.executeNormal(context, url, imageView, option);
-        loading.set(false);
     }
 
     /**
-     * ✅ AES 图（不写文件，直接 Bitmap）
+     * AES 图（不写文件，直接 Bitmap）
+     * [FIX] 移除 AtomicBoolean，避免并发加载被错误拦截
      */
     public void loadAesBitmap(
             @NonNull String url,
@@ -77,8 +69,6 @@ public class ImageLoader {
             @NonNull LoadOption option,
             @NonNull AesOption aesOption
     ) {
-        if (!loading.compareAndSet(false, true)) return;
         LoadExecutor.executeAesBitmap(context, url, imageView, option, aesOption);
-        loading.set(false);
     }
 }

@@ -1,218 +1,399 @@
---------------------------普通 URL 加载（最常用）--------------------------
-// 初始化 ImageLoader（必须用 Application Context）
-ImageLoader imageLoader = ImageLoader.with(getApplicationContext());
+=================================================================
+GlideHelper 企业级实战示例（全场景覆盖）
+=================================================================
 
-// 创建基础配置
-LoadOption option = new LoadOption()
-        .placeholder(R.drawable.bg_image_placeholder) // 占位图
-        .error(R.drawable.bg_image_error); // 错误图
+目录：
+1. 基础配置与初始化
+2. 常规图片加载（占位图、圆角、圆形）
+3. RecyclerView 极致优化（防卡顿、防泄漏）
+4. 网络请求增强（Cookie、Header、鉴权）
+5. AES 加密图片加载（鸿蒙/Android 双端兼容）
+6. 缓存策略详解（内存、磁盘、自定义清理）
+7. 图片质量与带宽优化
+8. 缩略图与预加载
+9. 水印方案（无 GPU 风险，推荐）
+10. 错误处理与降级策略
+11. 特殊场景（大图、GIF、过渡动画）
+12. 完整组合示例（生产环境模板）
 
-// 执行加载
-ImageView imageView = findViewById(R.id.image_view);
-String imageUrl = "https://example.com/image.jpg";
+-----------------------------------------------------------------
+1. 基础配置与初始化
+-----------------------------------------------------------------
 
-imageLoader.load(imageUrl, imageView, option);
+【核心原则】ImageLoader 必须使用 ApplicationContext，防止 Activity 泄漏。
 
+public class BaseApplication extends Application {
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        // 提前初始化，避免首次加载卡顿
+        ImageLoader.with(this);
+        // 【重要】清理过期的 AES 缓存文件（7天自动清理）
+        LoadExecutor.clearExpiredAesCache(this);
+    }
+}
 
+-----------------------------------------------------------------
+2. 常规图片加载
+-----------------------------------------------------------------
 
+2.1 基础加载
+ImageLoader imageLoader = ImageLoader.with(context);
+ImageView imageView = findViewById(R.id.iv_avatar);
 
---------------------------圆形图片加载--------------------------
-LoadOption circleOption = new LoadOption()
-        .asCircle() // 圆形裁剪（优先级高于圆角）
-        .placeholder(R.drawable.ic_avatar_placeholder);
+imageLoader.load(
+    "https://example.com/avatar.jpg",
+    imageView,
+    new LoadOption()
+        .placeholder(R.drawable.place_holder)
+        .error(R.drawable.error_pic)
+);
 
-imageLoader.load(url, imageView, circleOption);
+2.2 圆形头像（常用于 Avatar）
+imageLoader.load(
+    url,
+    imageView,
+    new LoadOption().asCircle() // 自动处理 Border 和 Padding
+);
 
+2.3 圆角图片（常用于 CardView 内图片）
+// 推荐 8dp 或 12dp 圆角
+imageLoader.load(
+    url,
+    imageView,
+    new LoadOption().round(8)
+);
 
---------------------------圆角图片加载--------------------------
-LoadOption roundOption = new LoadOption()
-        .round(12) // 圆角半径（dp）
-        .placeholder(R.drawable.ic_placeholder);
+-----------------------------------------------------------------
+3. RecyclerView 极致优化
+-----------------------------------------------------------------
 
-imageLoader.load(url, imageView, roundOption);
+【关键点】
+1. 使用 forList() 开启省电模式。
+2. 固定 ImageView 尺寸（XML 中设置，切勿 wrap_content）。
+3. 监听滚动事件，滑动时暂停加载。
 
+XML 布局（必须）：
+<ImageView
+    android:layout_width="match_parent"
+    android:layout_height="200dp" <!-- 固定高度 -->
+    android:scaleType="centerCrop"/>
 
---------------------------列表场景加载（RecyclerView 优化）--------------------------
-1 LoadOption listOption = new LoadOption()
-        .forList() // 启用列表模式（自动应用 RGB_565 + 禁用缓存）
-        .round(4); // 小圆角
+Activity/Fragment 代码：
+RecyclerView recyclerView = findViewById(R.id.recycler_view);
 
-或者
-
-列表专用配置（GlideConfig）
-// 获取列表默认配置（RGB_565 + 无动画 + DATA 缓存）
-RequestOptions listOptions = GlideConfig.list(context);
-
-2 固定 ImageView 尺寸（防止重复测量）
- 如果 ImageView 高度是 wrap_content，滑动时会疯狂重新计算大小。
- ❌ 错误：
- <ImageView
-     android:layout_width="match_parent"
-     android:layout_height="wrap_content"/>
- ✅ 正确（推荐）：
- <ImageView
-     android:layout_width="match_parent"
-     android:layout_height="200dp"/>
-
-3 imageLoader.load(listItemUrl, listImageView, listOption);
-
-
-
-4 RecyclerView recyclerView = findViewById(R.id.recycler_view);
-
-// 滚动时暂停 Glide 请求，空闲时恢复（减少卡顿）
+// 1. 添加滚动监听（核心优化）
 recyclerView.addOnScrollListener(new GlideScrollListener());
 
+// 2. Adapter 中的 onBindViewHolder
+LoadOption listOption = new LoadOption()
+        .forList() // 内部自动：RGB_565 + 跳过内存缓存 + 无动画
+        .round(4);
 
--------------------------- 带 Cookie / Header 的加载--------------------------
-1. 单个 Cookie 添加
-LoadOption cookieOption = new LoadOption()
-        .addCookie("Authorization", "Bearer your_token_here")
-        .placeholder(R.drawable.ic_placeholder);
+imageLoader.load(item.getUrl(), holder.imageView, listOption);
 
-imageLoader.load(url, imageView, cookieOption);
+// 3. 防止 Item 复用导致的图片错乱（Glide 自动处理，无需手动 setTag，但需确保 Option 一致）
 
+-----------------------------------------------------------------
+4. 网络请求增强（Cookie / Header）
+-----------------------------------------------------------------
 
-2. 批量 Header 添加
+4.1 携带登录态 Cookie（最常用）
+LoadOption authOption = new LoadOption()
+        .addCookie("session_id", "abc123xyz")
+        .addCookie("user_token", "token_xyz");
+
+imageLoader.load(url, imageView, authOption);
+
+4.2 携带通用 Header（如 User-Agent、Referer）
 Map<String, String> headers = new HashMap<>();
-headers.put("User-Agent", "Android/1.0");
-headers.put("Accept", "image/webp,*/*");
+headers.put("User-Agent", "Android/AppVer1.0");
+headers.put("Referer", "https://app.example.com");
+headers.put("Accept", "image/webp,image/apng,image/*,*/*");
 
 LoadOption headerOption = new LoadOption()
-        .addCookies(headers);
+        .addHeaders(headers);
 
 imageLoader.load(url, imageView, headerOption);
 
+4.3 混合使用（Cookie + Header）
+LoadOption hybridOption = new LoadOption()
+        .addCookie("auth", "xxx")
+        .addHeaders(headers);
 
---------------------------AES 加密图片加载（鸿蒙兼容方案）--------------------------
-1. AES Key/IV 解析
-// 原始 Key/IV 字符串（格式：数字_数字_...）
-String keyStr = "102_53_100_57_49_48_55_52";
-String ivStr = "49_48_55_52_102_53_100_57";
+-----------------------------------------------------------------
+5. AES 加密图片加载（鸿蒙/Android 双端兼容）
+-----------------------------------------------------------------
 
-// 方式一：通过 AesOption 创建（推荐）
-AesOption aesOption = AesOption.create(keyStr, ivStr);
-2. AES 图片加载（核心方法）
-// AES 专用配置（必须禁用 Glide 缓存）
-LoadOption aesOptionConfig = new LoadOption()
-        .placeholder(R.drawable.ic_placeholder)
-        .error(R.drawable.ic_error)
-        .skipMemoryCache(true) // 跳过内存缓存（鸿蒙必选）
-        .diskCacheStrategy(DiskCacheStrategy.NONE); // 禁用磁盘缓存（鸿蒙必选）
+【适用场景】私密相册、付费内容、防抓包资源。
+【鸿蒙注意】必须禁用 Glide 缓存，采用“解密->写文件->加载文件”方案。
 
-// 执行 AES 图片加载
-String aesImageUrl = "https://example.com/aes_image.bin";
-imageLoader.loadAesBitmap(aesImageUrl, imageView, aesOptionConfig, aesOption);
+5.1 定义 AES Key 和 IV（后端约定格式：102_53_100...）
+private static final String AES_KEY = "102_53_100_57_54_53...";
+private static final String AES_IV = "49_48_55_52_102_53...";
 
+// 全局初始化一次即可
+final AesOption globalAesOption = AesOption.create(AES_KEY, AES_IV);
 
---------------------------磁盘缓存策略配置--------------------------
-DiskCacheStrategy.NONE  不缓存任何内容到磁盘
-DiskCacheStrategy.DATA  只缓存原始未修改数据（如原图、AES 解密前的文件）
-DiskCacheStrategy.RESOURCE  只缓存最终解码后的资源（如 Bitmap）
-DiskCacheStrategy.AUTOMATIC  ✅ 默认值，Glide 根据图片类型自动选择
-DiskCacheStrategy.ALL ✅ 同时缓存 DATA + RESOURCE
+5.2 加载 AES 图片
+LoadOption aesLoadOption = new LoadOption()
+        .placeholder(R.drawable.decrypting)
+        .error(R.drawable.decrypt_fail)
+        // 【鸿蒙强制要求】禁止 Glide 接管缓存，交由文件系统处理
+        .skipMemoryCache(true)
+        .diskCacheStrategy(DiskCacheStrategy.NONE);
 
-禁用缓存（鸿蒙 AES 必选）
-LoadOption noCacheOption = new LoadOption().diskCacheStrategy(DiskCacheStrategy.NONE).skipMemoryCache(true);
+imageLoader.loadAesBitmap(
+        "https://example.com/encrypted.bin",
+        imageView,
+        aesLoadOption,
+        globalAesOption // 传入 AES 配置
+);
 
--------------------------内存缓存开关--------------------------
-.skipMemoryCache(true) 禁用内存缓存              不把本次加载的图片放入内存缓存中
-场景                原因
-AES 解密图片
-图片频繁变化     防止旧图命中缓存
-一次性展示      没必要占内存
+5.3 异常处理
+// LoadExecutor 内部已捕获 RejectedExecutionException
+// 若线程池饱和，会自动显示 errorResId
+// 若解密失败，会自动显示 errorResId
 
-.skipMemoryCache(false)启用内存缓存（默认值）      把本次加载的图片放入内存缓存中
-场景             原因
-普通列表图片     会增加重复解码，掉帧
-大图           每次都重新下载/解码
-静态资源        浪费性能
+-----------------------------------------------------------------
+6. 缓存策略详解
+-----------------------------------------------------------------
 
+6.1 磁盘缓存策略
+| 策略              | 说明                                      | 适用场景               |
+|-------------------|-------------------------------------------|------------------------|
+| NONE              | 不缓存                                    | AES 解密、极高频变动图 |
+| DATA             | 缓存原始数据                              | 需要多次变换的图片     |
+| RESOURCE         | 缓存处理后的资源                          | 固定尺寸展示           |
+| AUTOMATIC (默认) | Glide 智能判断                            | 普通场景               |
+| ALL              | 既缓存原始数据也缓存资源                  | 需要预加载的场景       |
 
---------------------------图片质量配置--------------------------
-1. 高清模式（ARGB_8888）
-LoadOption highQualityOption = new LoadOption().decodeFormat(DecodeFormat.PREFER_ARGB_8888);
-2. 列表省内存模式（RGB_565）
-LoadOption listQualityOption = new LoadOption().decodeFormat(DecodeFormat.PREFER_RGB_565);
+6.2 内存缓存开关
+// 禁用内存缓存（适合一次性展示或防内存峰值）
+.skipMemoryCache(true)
 
+// 启用内存缓存（默认，适合列表复用）
+.skipMemoryCache(false)
 
---------------------------缩略图加载--------------------------
-LoadOption thumbnailOption = new LoadOption().thumbnail(0.5f); // 加载原图的 50%（范围 0~1）
+6.3 手动清理缓存
+// 清理 Glide 自身缓存
+Glide.get(context).clearMemory(); // 主线程
+new Thread(() -> Glide.get(context).clearDiskCache()).start(); // 子线程
 
-imageLoader.load(url, imageView, thumbnailOption);
+// 【重要】清理本库生成的 AES 临时文件
+LoadExecutor.clearExpiredAesCache(context);
 
+-----------------------------------------------------------------
+7. 图片质量与带宽优化
+-----------------------------------------------------------------
 
+7.1 高清模式（PNG、透明图、头像）
+LoadOption hdOption = new LoadOption()
+        .decodeFormat(DecodeFormat.PREFER_ARGB_8888);
 
---------------------------水印功能（无 GPU 风险）--------------------------
-常量              含义
-Gravity.TOP     顶部
-Gravity.BOTTOM  底部
-Gravity.START   起始边（LTR 为左，RTL 为右，推荐）
-Gravity.END     结束边（LTR 为右，RTL 为左，推荐）
-Gravity.LEFT    左侧（不推荐，已过时）
-Gravity.RIGHT   右侧（不推荐，已过时）
-Gravity.CENTER  水平 + 垂直居中
-Gravity.CENTER_HORIZONTAL  水平居中
-Gravity.CENTER_VERTICAL       垂直居中
+7.2 省流模式（列表、背景图、不透明图）
+// RGB_565 比 ARGB_8888 节省 50% 内存
+LoadOption saveTrafficOption = new LoadOption()
+        .decodeFormat(DecodeFormat.PREFER_RGB_565);
 
-Gravity.BOTTOM | Gravity.END     右下角
-Gravity.BOTTOM | Gravity.START   左下角
-Gravity.TOP | Gravity.END        右上角
-Gravity.TOP | Gravity.START      左上角
+7.3 限制图片尺寸（防止 OOM）
+// 配合 Glide 的 override，这里通过 RequestOptions 透传
+RequestOptions options = GlideConfig.base(context)
+        .override(720, 1280); // 限制最大宽高
 
-1. 代码配置水印
-LoadOption watermarkOption = new LoadOption()
-        .watermark(
-                "Confidential", // 水印文字
-                Gravity.BOTTOM | Gravity.END, // 位置：右下角
-                180, // 透明度（0~255）
-                0xFF333333, // 颜色（深灰色）
-                12 // 文字大小（sp）
-        );
-2. XML 添加水印视图
+-----------------------------------------------------------------
+8. 缩略图与预加载
+-----------------------------------------------------------------
+
+8.1 缩略图加载（提升感知速度）
+// 先加载原图 10% 质量的缩略图，再加载原图
+imageLoader.load(
+    url,
+    imageView,
+    new LoadOption().thumbnail(0.1f)
+);
+
+8.2 预加载（ViewPager2 / 详情页）
+// 提前缓存到磁盘，浏览时无等待
+Glide.with(context)
+     .downloadOnly()
+     .load(url)
+     .submit();
+
+-----------------------------------------------------------------
+9. 水印方案（无 GPU 风险，推荐）
+-----------------------------------------------------------------
+
+【优势】不操作 Bitmap，仅绘制文字，彻底规避 Gralloc / GPU 泄漏。
+
+9.1 XML 布局（FrameLayout 叠加）
 <FrameLayout
     android:layout_width="match_parent"
-    android:layout_height="wrap_content">
+    android:layout_height="200dp">
 
     <ImageView
-        android:id="@+id/image_view"
+        android:id="@+id/iv_content"
         android:layout_width="match_parent"
-        android:layout_height="200dp"/>
+        android:layout_height="match_parent"
+        android:scaleType="centerCrop"/>
 
-    <!-- 水印视图（覆盖在 ImageView 上） -->
     <com.example.glidehelper.WatermarkOverlayView
-        android:id="@+id/watermark_view"
+        android:id="@+id/view_watermark"
         android:layout_width="match_parent"
         android:layout_height="match_parent"/>
 </FrameLayout>
-3. 从 LoadOption 一键应用水印
-WatermarkOverlayView watermarkView = findViewById(R.id.watermark_view);
-watermarkView.applyFromOption(watermarkOption);
 
+9.2 代码配置（新写法：解耦）
+// 1. 构建水印配置
+WatermarkConfig config = new WatermarkConfig.Builder()
+        .text("仅供审核使用")
+        .gravity(Gravity.BOTTOM | Gravity.END)
+        .alpha(180) // 0-255
+        .color(0x80FF0000) // 半透明红色
+        .textSizeSp(12)
+        .build();
 
---------------------------完整组合示例（AES + 列表 + 水印）--------------------------
-// 1. 初始化
-ImageLoader imageLoader = ImageLoader.with(getApplicationContext());
+// 2. 应用配置
+WatermarkOverlayView watermarkView = findViewById(R.id.view_watermark);
+watermarkView.applyFromConfig(config);
 
-// 2. AES 配置
-AesOption aesOption = AesOption.create(keyStr, ivStr);
+// 3. 加载底图
+imageLoader.load(url, findViewById(R.id.iv_content), new LoadOption());
 
-// 3. 加载配置（列表 + 水印 + AES 兼容）
+9.3 代码配置（旧写法：兼容）
 LoadOption option = new LoadOption()
-        .forList() // 列表优化
-        .round(8) // 圆角
-        .watermark("Preview", Gravity.BOTTOM, 180, 0xFFFFFFFF, 10) // 水印
-        .skipMemoryCache(true) // 鸿蒙必选
-        .diskCacheStrategy(DiskCacheStrategy.NONE); // 鸿蒙必选
-
-// 4. 加载 AES 图片
-imageLoader.loadAesBitmap(
-        "https://example.com/list_aes_image.bin",
-        imageView,
-        option,
-        aesOption
-);
-
-// 5. 应用水印
-WatermarkOverlayView watermarkView = findViewById(R.id.watermark);
+        .watermark("内部资料", Gravity.CENTER, 128, 0xFFFFFFFF, 14);
 watermarkView.applyFromOption(option);
+
+-----------------------------------------------------------------
+10. 错误处理与降级策略
+-----------------------------------------------------------------
+
+10.1 加载失败兜底
+LoadOption safeOption = new LoadOption()
+        .placeholder(R.drawable.loading)
+        .error(R.drawable.load_fail) // 网络错误或解码失败时显示
+        .fallback(R.drawable.no_image); // Model 为空（url=null）时显示
+
+10.2 重试机制（Glide 内置）
+// Glide 默认会重试，可通过 OkHttp 集成自定义重试次数
+// 本库已处理 HttpURLConnection 的错误流消费，防止连接泄漏
+
+-----------------------------------------------------------------
+11. 特殊场景
+-----------------------------------------------------------------
+
+11.1 加载 GIF
+// 与普通图片无异，Glide 自动识别
+// 注意：GIF 消耗内存较大，列表中使用需谨慎
+imageLoader.load(gifUrl, imageView, new LoadOption());
+
+11.2 过渡动画控制
+// 列表禁用动画（提升性能）
+LoadOption noAnim = new LoadOption().forList();
+
+// 详情页启用淡入动画
+RequestOptions fadeOptions = GlideConfig.base(context)
+        .transition(DrawableTransitionOptions.withCrossFade(300));
+
+-----------------------------------------------------------------
+12. 完整组合示例（生产环境模板）
+-----------------------------------------------------------------
+
+场景：RecyclerView 中加载带水印的 AES 加密图片，支持鉴权。
+
+public class SecureListActivity extends AppCompatActivity {
+
+    private ImageLoader imageLoader;
+    private AesOption aesOption;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_list);
+
+        // 1. 初始化 Loader
+        imageLoader = ImageLoader.with(getApplicationContext());
+
+        // 2. 初始化 AES 配置（全局仅需一次）
+        String key = getString(R.string.aes_key);
+        String iv = getString(R.string.aes_iv);
+        aesOption = AesOption.create(key, iv);
+
+        // 3. 配置 RecyclerView
+        RecyclerView recyclerView = findViewById(R.id.recycler_view);
+        recyclerView.setHasFixedSize(true); // 优化性能
+        recyclerView.addOnScrollListener(new GlideScrollListener());
+        recyclerView.setAdapter(new SecureAdapter());
+    }
+
+    class SecureAdapter extends RecyclerView.Adapter<SecureAdapter.VH> {
+
+        @NonNull
+        @Override
+        public SecureAdapter.VH onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
+            View view = LayoutInflater.from(parent.getContext())
+                    .inflate(R.layout.item_secure_image, parent, false);
+            return new VH(view);
+        }
+
+        @Override
+        public void onBindViewHolder(@NonNull SecureAdapter.VH holder, int position) {
+            String url = getData(position);
+
+            // 4. 构建加载配置（列表 + AES + 水印）
+            LoadOption loadOption = new LoadOption()
+                    .forList() // 列表优化
+                    .round(6) // 圆角
+                    .skipMemoryCache(true) // AES 必须
+                    .diskCacheStrategy(DiskCacheStrategy.NONE) // AES 必须
+                    .addCookie("token", UserManager.getToken()) // 鉴权
+                    .error(R.drawable.ic_broken_image);
+
+            // 5. 加载 AES 图片
+            imageLoader.loadAesBitmap(
+                    url,
+                    holder.imageView,
+                    loadOption,
+                    aesOption
+            );
+
+            // 6. 应用水印
+            WatermarkConfig watermarkConfig = new WatermarkConfig.Builder()
+                    .text("Confidential")
+                    .gravity(Gravity.BOTTOM | Gravity.END)
+                    .alpha(160)
+                    .color(0x88FFFFFF)
+                    .textSizeSp(10)
+                    .build();
+            holder.watermarkView.applyFromConfig(watermarkConfig);
+        }
+
+        class VH extends RecyclerView.ViewHolder {
+            ImageView imageView;
+            WatermarkOverlayView watermarkView;
+
+            VH(@NonNull View itemView) {
+                super(itemView);
+                imageView = itemView.findViewById(R.id.iv_content);
+                watermarkView = itemView.findViewById(R.id.view_watermark);
+            }
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        // 可选：清理过期缓存
+        // LoadExecutor.clearExpiredAesCache(this);
+    }
+}
+
+=================================================================
+✅ 核心优化点回顾：
+1. 线程安全：AES 解密使用单线程池，防止并发写文件冲突。
+2. 资源释放：严格管理 HttpURLConnection 和 ErrorStream，防止 FD 泄漏。
+3. 架构解耦：WatermarkConfig 解耦水印逻辑，方便单元测试。
+4. 鸿蒙兼容：AES 方案绕过系统缓存限制，采用文件直读。
+5. 列表流畅：滚动监听 + RGB_565 + 尺寸固定，杜绝卡顿。
+=================================================================

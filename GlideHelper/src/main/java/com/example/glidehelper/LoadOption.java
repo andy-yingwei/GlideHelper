@@ -2,6 +2,7 @@ package com.example.glidehelper;
 
 import android.annotation.SuppressLint;
 import android.content.res.Resources;
+import android.os.Build;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
 
@@ -15,6 +16,7 @@ import com.bumptech.glide.load.resource.bitmap.CircleCrop;
 import com.bumptech.glide.load.resource.bitmap.RoundedCorners;
 import com.bumptech.glide.request.RequestOptions;
 
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -23,7 +25,8 @@ import java.util.Map;
  * LoadOption
  * ----------------------------------------------------
  * ✅ 基础加载配置（普通图 / AES 图通用）
- * ✅ 包含 Cookie / 缓存 / 图片质量 / UI 变换
+ * ✅ 区分 Cookie / Header，支持单条 & Map 添加
+ * ✅ 包含缓存 / 图片质量 / UI 变换
  * ✅ 支持「无 GPU 风险」的水印（View 叠加方案）
  * ====================================================
  */
@@ -40,7 +43,10 @@ public class LoadOption {
     // ========== 列表优化 ==========
     private boolean isListMode;
 
-    // ========== Cookie Header ==========
+    // ========== Cookie（独立管理） ==========
+    private final Map<String, String> cookies = new LinkedHashMap<>();
+
+    // ========== Header（非 Cookie） ==========
     private final Map<String, String> headers = new LinkedHashMap<>();
 
     // ========== 缓存配置 ==========
@@ -59,7 +65,7 @@ public class LoadOption {
     private int watermarkAlpha = 180;
     private int watermarkColor = 0xFFFFFFFF;
     private int watermarkColorRes;
-    private float watermarkTextSize = 14; // ✅ 默认文字大小（sp）
+    private float watermarkTextSize = 14;
 
     // ========== 基础配置方法 ==========
 
@@ -90,15 +96,47 @@ public class LoadOption {
         return this;
     }
 
-    // ========== Cookie Header 方法 ==========
+    // =======================
+    // ✅ Cookie 相关（推荐）
+    // =======================
 
+    /**
+     * 添加单个 Cookie（推荐）
+     */
     public LoadOption addCookie(String key, String value) {
+        cookies.put(key, value);
+        return this;
+    }
+
+    /**
+     * 批量添加 Cookie（推荐）
+     */
+    public LoadOption addCookies(Map<String, String> cookies) {
+        if (cookies != null) {
+            this.cookies.putAll(cookies);
+        }
+        return this;
+    }
+
+    // =======================
+    // ✅ Header 相关
+    // =======================
+
+    /**
+     * 添加单个 Header（非 Cookie）
+     */
+    public LoadOption addHeader(String key, String value) {
         headers.put(key, value);
         return this;
     }
 
-    public LoadOption addCookies(Map<String, String> cookies) {
-        if (cookies != null) headers.putAll(cookies);
+    /**
+     * 批量添加 Header（非 Cookie）
+     */
+    public LoadOption addHeaders(Map<String, String> headers) {
+        if (headers != null) {
+            this.headers.putAll(headers);
+        }
         return this;
     }
 
@@ -130,11 +168,8 @@ public class LoadOption {
         return this;
     }
 
-    // ========== ✅ 水印配置（无 GPU 风险） ==========
+    // ========== ✅ 水印配置 ==========
 
-    /**
-     * ✅ 设置水印（支持直接颜色值）
-     */
     public LoadOption watermark(
             String text,
             int gravity,
@@ -151,9 +186,6 @@ public class LoadOption {
         return this;
     }
 
-    /**
-     * ✅ 设置水印（支持颜色资源 ID）
-     */
     public LoadOption watermarkRes(
             String text,
             int gravity,
@@ -170,7 +202,32 @@ public class LoadOption {
         return this;
     }
 
-    // ========== 内部方法（LoadExecutor 用） ==========
+    // ============================
+    // ✅ 内部方法（LoadExecutor 用）
+    // ============================
+
+    /**
+     * 获取最终用于网络请求的 Header（含 Cookie）
+     */
+    Map<String, String> getFinalHeaders() {
+        Map<String, String> result = new HashMap<>(headers);
+
+        if (!cookies.isEmpty()) {
+            StringBuilder cookieBuilder = new StringBuilder();
+            for (Map.Entry<String, String> entry : cookies.entrySet()) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                    if (!cookieBuilder.isEmpty()) {
+                        cookieBuilder.append("; ");
+                    }
+                }
+                cookieBuilder.append(entry.getKey())
+                        .append("=")
+                        .append(entry.getValue());
+            }
+            result.put("Cookie", cookieBuilder.toString());
+        }
+        return result;
+    }
 
     @SuppressLint("CheckResult")
     RequestOptions toRequestOptions() {
@@ -185,21 +242,24 @@ public class LoadOption {
             options.transform(new CircleCrop());
         }
 
+        /*
+         * [IMPROVE]
+         * listMode 仅做性能兜底
+         * 不再无条件覆盖用户显式配置
+         */
         if (isListMode) {
-            options.format(DecodeFormat.PREFER_RGB_565)
-                    .diskCacheStrategy(DiskCacheStrategy.NONE)
-                    .skipMemoryCache(true);
+            if (decodeFormat == DecodeFormat.DEFAULT) {
+                options.format(DecodeFormat.PREFER_RGB_565);
+            }
+            if (diskCacheStrategy == DiskCacheStrategy.AUTOMATIC) {
+                options.diskCacheStrategy(DiskCacheStrategy.NONE);
+            }
+            if (!skipMemoryCache) {
+                options.skipMemoryCache(true);
+            }
         }
 
-        options.diskCacheStrategy(diskCacheStrategy)
-                .skipMemoryCache(skipMemoryCache)
-                .format(decodeFormat);
-
         return options;
-    }
-
-    Map<String, String> getHeaders() {
-        return headers;
     }
 
     float getThumbnail() {
@@ -210,7 +270,7 @@ public class LoadOption {
         return isListMode;
     }
 
-    // ========== ✅ 水印 Getter（必须） ==========
+    // ========== 水印 Getter ==========
 
     public String getWatermarkText() {
         return watermarkText;
@@ -236,7 +296,7 @@ public class LoadOption {
         return watermarkTextSize;
     }
 
-    // ========== ✅ 原有 Getter（必须） ==========
+    // ========== 原有 Getter ==========
 
     public int getPlaceholderResId() {
         return placeholderResId;
