@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="tag_aes_url" type="id"/>
+    <item name="tag_aes_future" type="id"/>
+    <item name="tag_aes_call" type="id"/>
+</resources>

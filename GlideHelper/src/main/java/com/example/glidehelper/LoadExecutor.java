@@ -13,6 +13,7 @@ import androidx.annotation.Nullable;
 
 import com.bumptech.glide.Glide;
 import com.bumptech.glide.load.DataSource;
+import com.bumptech.glide.load.engine.DiskCacheStrategy;
 import com.bumptech.glide.load.engine.GlideException;
 import com.bumptech.glide.load.model.GlideUrl;
 import com.bumptech.glide.load.model.LazyHeaders;
@@ -20,59 +21,97 @@ import com.bumptech.glide.request.RequestListener;
 import com.bumptech.glide.request.RequestOptions;
 import com.bumptech.glide.request.target.Target;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.security.MessageDigest;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 
 import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
+import okhttp3.Call;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
+
 /**
  * ====================================================
- * LoadExecutor
+ * LoadExecutor（OkHttp 最终修复版）
  * ----------------------------------------------------
- * ✅ Glide 实际执行者
- * ✅ 负责普通加载 / AES 解密加载
- * ✅ 封装线程切换与错误处理逻辑
+ *
+ * 【必须依赖】
+ *   implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+ *
+ * 修复点：
+ *   ✅ 修复 "Variable 'future' might not have been initialized"
+ *      原因：Lambda finally 中通过闭包引用 future，编译器认为可能未初始化
+ *      方案：finally 中改用 url 相等性判断清理 Tag，不再引用 future/call
+ *
+ * 核心特性：
+ *   ✅ OkHttp Call.cancel() 真正关闭 Socket，彻底释放线程
+ *   ✅ 子线程零 View 访问，主线程 Tag 双重校验防错乱
+ *   ✅ 缓存文件名 = URL MD5 + Key MD5，永久命中不重复解密
+ *   ✅ 自适应线程池（4~6 线程）
+ *
+ * 需要在 res/values/ids.xml 中定义：
+ *   <item name="tag_aes_url" type="id"/>
+ *   <item name="tag_aes_future" type="id"/>
+ *   <item name="tag_aes_call" type="id"/>
+ *
+ * Adapter 中需要在 onViewRecycled 调用：
+ *   LoadExecutor.cancelAndClear(holder.imageView);
+ *
  * ====================================================
  */
 public class LoadExecutor {
 
     private static final String TAG = "LoadExecutor";
-    private static final long CACHE_MAX_AGE = 7 * 24 * 60 * 60 * 1000L; // 7天
 
-    /**
-     * [IMPROVE] 网络超时常量
-     */
-    private static final int CONNECT_TIMEOUT = 15000;
-    private static final int READ_TIMEOUT = 15000;
+    // ===================== 常量 =====================
 
-    /**
-     * [IMPROVE] 单线程池，避免 AES 并发写同一文件
-     */
-    private static final ExecutorService AES_EXECUTOR =
-            Executors.newSingleThreadExecutor();
+    private static final long CACHE_MAX_AGE = 7L * 24 * 60 * 60 * 1000;
+    private static final String AES_CACHE_PREFIX = "aes_";
+    private static final String AES_CACHE_SUFFIX = ".cache";
 
-    /**
-     * [IMPROVE] 主线程 Handler 单例，避免频繁创建对象
-     */
+    private static final int TAG_AES_URL = R.id.tag_aes_url;
+    private static final int TAG_AES_FUTURE = R.id.tag_aes_future;
+    private static final int TAG_AES_CALL = R.id.tag_aes_call;
+
+    // ===================== OkHttpClient =====================
+
+    private static final OkHttpClient OK_HTTP_CLIENT = new OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .writeTimeout(15, TimeUnit.SECONDS)
+            .build();
+
+    // ===================== 线程池 =====================
+
+    private static final ExecutorService AES_EXECUTOR;
+
+    static {
+        int cores = Runtime.getRuntime().availableProcessors();
+        int poolSize = (cores <= 4) ? 4 : (cores <= 6) ? cores : 6;
+        AES_EXECUTOR = Executors.newFixedThreadPool(poolSize);
+        Log.d(TAG, "AES Executor initialized, CPU cores=" + cores + ", pool=" + poolSize);
+    }
+
+    // ===================== Handler =====================
+
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
 
-    /**
-     * 普通图（支持 Cookie / Header）
-     * [FIX] 移除 AtomicBoolean，避免全局阻塞图片加载
-     * [FIX] 使用 GlideUrl 携带请求头，解决原实现 Header 失效问题
-     */
+    // ====================================================
+    // 公开方法（API 不变）
+    // ====================================================
+
     static void executeNormal(
             @NonNull Context context,
             @NonNull String url,
@@ -80,11 +119,8 @@ public class LoadExecutor {
             @NonNull LoadOption option
     ) {
         RequestOptions options = option.toRequestOptions();
-
-        // [FIX] 构建带 Header 的 GlideUrl，统一请求头逻辑
         GlideUrl glideUrl = buildGlideUrl(url, option.getFinalHeaders());
 
-        // [IMPROVE] 支持 thumbnail
         if (option.getThumbnail() > 0f) {
             Glide.with(context)
                     .load(glideUrl)
@@ -100,22 +136,7 @@ public class LoadExecutor {
     }
 
     /**
-     * [FIX] 构建带 Header（含 Cookie）的 GlideUrl
-     * 统一普通加载与 AES 加载的请求头处理逻辑
-     */
-    private static GlideUrl buildGlideUrl(String url, Map<String, String> headers) {
-        if (headers == null || headers.isEmpty()) {
-            return new GlideUrl(url);
-        }
-        LazyHeaders.Builder builder = new LazyHeaders.Builder();
-        for (Map.Entry<String, String> entry : headers.entrySet()) {
-            builder.addHeader(entry.getKey(), entry.getValue());
-        }
-        return new GlideUrl(url, builder.build());
-    }
-
-    /**
-     * 鸿蒙最终方案：解密 → 写文件 → Glide 加载文件
+     * AES 图加载（OkHttp 版）
      */
     @SuppressLint("CheckResult")
     static void executeAesBitmap(
@@ -125,45 +146,106 @@ public class LoadExecutor {
             @NonNull LoadOption option,
             @NonNull AesOption aesOption
     ) {
+        // ===== Step 1: 主线程绑定 URL Tag =====
+        imageView.setTag(TAG_AES_URL, url);
+
+        // ===== Step 2: 取消旧任务（关闭旧 Socket + 中断旧线程） =====
+        cancelTask(imageView);
+
+        // ===== Step 3: 主线程预计算缓存路径 =====
+        final File cacheDir = getCacheDir(context);
+        final String cacheFileName = generateCacheFileName(url, aesOption);
+
+        // ===== Step 4: 构建 OkHttp Request & Call =====
+        Request.Builder requestBuilder = new Request.Builder().url(url);
+        Map<String, String> headers = option.getFinalHeaders();
+        if (headers != null) {
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                requestBuilder.addHeader(entry.getKey(), entry.getValue());
+            }
+        }
+        final Request request = requestBuilder.build();
+        final Call call = OK_HTTP_CLIENT.newCall(request);
+
+        // [FIX] 将 Call 绑定到 View Tag，供 cancel 时使用
+        imageView.setTag(TAG_AES_CALL, call);
+
+        // ===== Step 5: 提交到线程池 =====
         try {
-            // [FIX] 捕获线程池拒绝异常，防止崩溃并提供降级处理
-            AES_EXECUTOR.execute(() -> {
-                HttpURLConnection conn = null;
+            Future<?> future = AES_EXECUTOR.submit(() -> {
                 try {
-                    // 1. 下载（使用统一拼接后的 Header，含标准 Cookie）
-                    conn = openConnection(url, option.getFinalHeaders());
-                    byte[] encrypted = downloadEncrypted(conn);
+                    // [核心原则] 子线程中绝不访问 imageView！
 
-                    // 2. 解密
-                    byte[] decrypted = decrypt(encrypted, aesOption);
+                    File cacheFile = new File(cacheDir, cacheFileName);
+                    final File validCacheFile;
 
-                    // 3. 写文件（鸿蒙允许）
-                    File cacheFile = writeToCache(context, url, decrypted);
+                    // 1. 检查本地缓存是否已存在
+                    if (cacheFile.exists() && cacheFile.length() > 0) {
+                        validCacheFile = cacheFile;
+                    } else {
+                        // 2. 同步执行网络请求
+                        Response response = call.execute();
 
+                        if (call.isCanceled()) {
+                            Log.d(TAG, "Call 已被取消，中断任务: " + url);
+                            return;
+                        }
+
+                        if (!response.isSuccessful()) {
+                            throw new IOException("HTTP " + response.code() + " for " + url);
+                        }
+
+                        ResponseBody body = response.body();
+                        if (body == null) {
+                            throw new IOException("Response body is null: " + url);
+                        }
+                        byte[] encrypted = body.bytes();
+
+                        // 3. 检查线程中断状态
+                        if (Thread.currentThread().isInterrupted()) {
+                            Log.d(TAG, "线程被中断，跳过解密: " + url);
+                            return;
+                        }
+
+                        // 4. 解密
+                        byte[] decrypted = decrypt(encrypted, aesOption);
+
+                        // 5. 写入缓存文件
+                        writeCacheFile(cacheFile, decrypted);
+                        validCacheFile = cacheFile;
+                    }
+
+                    // 6. 回到主线程加载
                     MAIN_HANDLER.post(() -> {
-                        // [FIX] 防止 Activity 销毁后继续操作 View 导致泄漏或崩溃
+                        // 主线程中校验 Tag
+                        Object currentTag = imageView.getTag(TAG_AES_URL);
+                        if (!url.equals(currentTag)) {
+                            Log.d(TAG, "View 已复用，丢弃结果: " + url);
+                            return;
+                        }
+
                         if (!imageView.isAttachedToWindow()) {
                             return;
                         }
 
-                        RequestOptions options = option.toRequestOptions();
+                        // 先清除 Glide 旧请求，防止上一张图闪现
+                        Glide.with(imageView).clear(imageView);
 
-                        // 强制 NONE 缓存（鸿蒙关键）
-                        options.diskCacheStrategy(com.bumptech.glide.load.engine.DiskCacheStrategy.NONE)
-                                .skipMemoryCache(true);
+                        RequestOptions glideOptions = option.toRequestOptions();
+                        glideOptions.diskCacheStrategy(DiskCacheStrategy.NONE)
+                                .skipMemoryCache(false);
 
-                        Glide.with(context)
-                                .load(cacheFile)
-                                .apply(options)
+                        Glide.with(imageView)
+                                .load(validCacheFile)
+                                .apply(glideOptions)
                                 .listener(new RequestListener<Drawable>() {
                                     @Override
                                     public boolean onLoadFailed(
                                             @Nullable GlideException e,
                                             Object model,
                                             @NonNull Target<Drawable> target,
-                                            boolean isFirstResource
-                                    ) {
-                                        Log.e(TAG, "解密文件加载失败: " + cacheFile.getName(), e);
+                                            boolean isFirstResource) {
+                                        Log.e(TAG, "Glide 加载失败: " + url, e);
                                         if (option.getErrorResId() != 0) {
                                             imageView.setImageResource(option.getErrorResId());
                                         }
@@ -176,159 +258,197 @@ public class LoadExecutor {
                                             @NonNull Object model,
                                             Target<Drawable> target,
                                             @NonNull DataSource dataSource,
-                                            boolean isFirstResource
-                                    ) {
+                                            boolean isFirstResource) {
                                         return false;
                                     }
                                 })
                                 .into(imageView);
                     });
 
-                } catch (Exception e) {
-                    Log.e(TAG, "AES进程失败: " + url, e);
+                } catch (IOException e) {
+                    if (call.isCanceled() || Thread.currentThread().isInterrupted()) {
+                        Log.d(TAG, "任务正常取消: " + url);
+                        return;
+                    }
+                    Log.e(TAG, "AES 网络/IO 错误: " + url, e);
                     MAIN_HANDLER.post(() -> {
-                        if (option.getErrorResId() != 0) {
+                        Object currentTag = imageView.getTag(TAG_AES_URL);
+                        if (url.equals(currentTag) && option.getErrorResId() != 0) {
+                            imageView.setImageResource(option.getErrorResId());
+                        }
+                    });
+                } catch (Exception e) {
+                    Log.e(TAG, "AES 任务失败: " + url, e);
+                    MAIN_HANDLER.post(() -> {
+                        Object currentTag = imageView.getTag(TAG_AES_URL);
+                        if (url.equals(currentTag) && option.getErrorResId() != 0) {
                             imageView.setImageResource(option.getErrorResId());
                         }
                     });
                 } finally {
-                    // [FIX] 确保 HttpURLConnection 被关闭，释放资源
-                    if (conn != null) {
-                        conn.disconnect();
-                    }
+                    // [FIX] 不再引用 future/call，改用 url 相等性判断清理 Tag
+                    // 避免 "Variable 'future' might not have been initialized" 编译错误
+                    MAIN_HANDLER.post(() -> {
+                        Object currentUrl = imageView.getTag(TAG_AES_URL);
+                        if (url.equals(currentUrl)) {
+                            imageView.setTag(TAG_AES_CALL, null);
+                            imageView.setTag(TAG_AES_FUTURE, null);
+                        }
+                    });
                 }
             });
+
+            // 绑定 Future 到 View Tag
+            imageView.setTag(TAG_AES_FUTURE, future);
+
         } catch (RejectedExecutionException e) {
-            // [FIX] 线程池饱和或已关闭时的降级处理
-            Log.e(TAG, "aes执行器拒绝了url的任务: " + url, e);
+            Log.e(TAG, "AES 线程池拒绝任务: " + url, e);
             if (option.getErrorResId() != 0) {
                 imageView.setImageResource(option.getErrorResId());
             }
         }
     }
 
+    // ====================================================
+    // 公开工具方法
+    // ====================================================
+
     /**
-     * [IMPROVE] 封装连接创建逻辑，便于统一管理超时和请求头
+     * RecyclerView 回收时调用
      */
-    private static HttpURLConnection openConnection(String url, Map<String, String> headers) throws Exception {
-        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-        conn.setConnectTimeout(CONNECT_TIMEOUT);
-        conn.setReadTimeout(READ_TIMEOUT);
-        conn.setDoInput(true);
-        // [IMPROVE] 禁止系统缓存，确保获取最新数据
-        conn.setUseCaches(false);
-        for (Map.Entry<String, String> entry : headers.entrySet()) {
-            conn.setRequestProperty(entry.getKey(), entry.getValue());
+    public static void cancelAndClear(@NonNull ImageView imageView) {
+        cancelTask(imageView);
+        imageView.setTag(TAG_AES_URL, null);
+        imageView.setTag(TAG_AES_FUTURE, null);
+        imageView.setTag(TAG_AES_CALL, null);
+        try {
+            Glide.with(imageView).clear(imageView);
+        } catch (Exception ignored) {
         }
-        return conn;
     }
 
     /**
-     * [IMPROVE] 增加 HTTP Response Code 校验
-     * 注意：此方法不关闭 HttpURLConnection，连接由调用者在 finally 块中关闭。
-     */
-    private static byte[] downloadEncrypted(HttpURLConnection conn) throws Exception {
-        int responseCode = conn.getResponseCode();
-        if (responseCode != HttpURLConnection.HTTP_OK) {
-            // [FIX] 完全消费错误流，防止连接泄漏
-            try (InputStream errorStream = conn.getErrorStream()) {
-                if (errorStream != null) {
-                    byte[] buffer = new byte[1024];
-                    while (errorStream.read(buffer) != -1) {
-                        // 丢弃数据，确保连接被完全释放
-                    }
-                }
-            }
-            throw new IOException("HTTP 错误代码: " + responseCode + " for URL: " + conn.getURL().toString());
-        }
-
-        try (InputStream in = conn.getInputStream();
-             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            byte[] buf = new byte[4096];
-            int len;
-            while ((len = in.read(buf)) != -1) {
-                out.write(buf, 0, len);
-            }
-            return out.toByteArray();
-        }
-    }
-
-    private static byte[] decrypt(byte[] data, AesOption aesOption) throws Exception {
-        Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
-        cipher.init(
-                Cipher.DECRYPT_MODE,
-                new SecretKeySpec(aesOption.getKey(), "AES"),
-                new IvParameterSpec(aesOption.getIv())
-        );
-        return cipher.doFinal(data);
-    }
-
-    /**
-     * 写文件（鸿蒙兼容方案）
-     * [IMPROVE] 使用 UUID 避免 hash 冲突
-     * [FIX] 写入失败时清理不完整文件
-     */
-    private static File writeToCache(Context context, String url, byte[] data) throws Exception {
-        File cacheDir = context.getExternalCacheDir(); // 鸿蒙推荐
-        if (cacheDir == null) {
-            cacheDir = context.getCacheDir();
-        }
-        File cacheFile = new File(
-                cacheDir,
-                "aes_" + Math.abs(url.hashCode()) + "_" + UUID.randomUUID() + ".tmp"
-        );
-        try (FileOutputStream fos = new FileOutputStream(cacheFile)) {
-            fos.write(data);
-        } catch (Exception e) {
-            // [FIX] 写入失败时删除不完整文件
-            if (cacheFile.exists()) {
-                boolean deleted = cacheFile.delete();
-                if (!deleted) {
-                    Log.w(TAG, "未能删除不完整的缓存文件: " + cacheFile.getName());
-                }
-            }
-            throw e; // 重新抛出异常，让上层处理
-        }
-        return cacheFile;
-    }
-
-    /**
-     * ====================================================
-     * [IMPROVE] 清理过期的 AES 缓存文件
-     * ----------------------------------------------------
-     * ✅ 建议在应用启动或退出时调用
-     * ✅ 删除超过 7 天的临时文件，避免磁盘占用过大
-     * ====================================================
+     * 清理过期的 AES 缓存文件
      */
     public static void clearExpiredAesCache(@NonNull Context context) {
-        File cacheDir = context.getExternalCacheDir();
-        if (cacheDir == null) {
-            cacheDir = context.getCacheDir();
-        }
-        if (cacheDir == null || !cacheDir.exists()) {
-            return;
-        }
+        File cacheDir = getCacheDir(context);
+        if (cacheDir == null || !cacheDir.exists()) return;
 
-        File[] files = cacheDir.listFiles(
-                (dir, name) -> name.startsWith("aes_") && name.endsWith(".tmp")
-        );
+        File[] files = cacheDir.listFiles((dir, name) ->
+                name.startsWith(AES_CACHE_PREFIX) && name.endsWith(AES_CACHE_SUFFIX));
 
-        if (files == null || files.length == 0) {
-            return;
-        }
+        if (files == null) return;
 
         long now = System.currentTimeMillis();
         for (File file : files) {
             try {
                 if (now - file.lastModified() > CACHE_MAX_AGE) {
-                    boolean deleted = file.delete();
-                    if (!deleted) {
-                        Log.w(TAG, "未能删除过期的缓存: " + file.getName());
+                    if (!file.delete()) {
+                        Log.w(TAG, "删除过期缓存失败: " + file.getName());
                     }
                 }
             } catch (SecurityException e) {
-                Log.w(TAG, "没有权限删除: " + file.getName(), e);
+                Log.w(TAG, "无权限删除: " + file.getName(), e);
             }
         }
+    }
+
+    // ====================================================
+    // 私有方法
+    // ====================================================
+
+    /**
+     * 取消 ImageView 上正在执行的任务
+     */
+    private static void cancelTask(@NonNull ImageView imageView) {
+        Object callTag = imageView.getTag(TAG_AES_CALL);
+        if (callTag instanceof Call) {
+            ((Call) callTag).cancel();
+        }
+
+        Object futureTag = imageView.getTag(TAG_AES_FUTURE);
+        if (futureTag instanceof Future) {
+            ((Future<?>) futureTag).cancel(true);
+        }
+    }
+
+    private static GlideUrl buildGlideUrl(String url, Map<String, String> headers) {
+        if (headers == null || headers.isEmpty()) {
+            return new GlideUrl(url);
+        }
+        LazyHeaders.Builder builder = new LazyHeaders.Builder();
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            builder.addHeader(entry.getKey(), entry.getValue());
+        }
+        return new GlideUrl(url, builder.build());
+    }
+
+    private static byte[] decrypt(byte[] data, AesOption aesOption) throws Exception {
+        Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+        cipher.init(Cipher.DECRYPT_MODE,
+                new SecretKeySpec(aesOption.getKey(), "AES"),
+                new IvParameterSpec(aesOption.getIv()));
+        return cipher.doFinal(data);
+    }
+
+    private static String generateCacheFileName(String url, AesOption aesOption) {
+        String urlHash = md5(url);
+        String keyHash = md5(bytesToHex(aesOption.getKey()));
+        return AES_CACHE_PREFIX + urlHash + "_" + keyHash + AES_CACHE_SUFFIX;
+    }
+
+    private static File getCacheDir(Context context) {
+        File dir = context.getExternalCacheDir();
+        if (dir == null) {
+            dir = context.getCacheDir();
+        }
+        return dir;
+    }
+
+    private static void writeCacheFile(File cacheFile, byte[] data) throws IOException {
+        File dir = cacheFile.getParentFile();
+        if (dir != null && !dir.exists()) {
+            dir.mkdirs();
+        }
+
+        File tempFile = new File(dir, cacheFile.getName() + ".tmp");
+
+        try (FileOutputStream fos = new FileOutputStream(tempFile)) {
+            fos.write(data);
+            fos.flush();
+        }
+
+        if (cacheFile.exists()) {
+            cacheFile.delete();
+        }
+
+        if (tempFile.renameTo(cacheFile)) {
+            return;
+        }
+
+        Log.w(TAG, "renameTo 失败，降级直接写入: " + cacheFile.getName());
+        try (FileOutputStream fos = new FileOutputStream(cacheFile)) {
+            fos.write(data);
+            fos.flush();
+        }
+        tempFile.delete();
+    }
+
+    private static String md5(String input) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            byte[] digest = md.digest(input.getBytes("UTF-8"));
+            return bytesToHex(digest);
+        } catch (Exception e) {
+            return String.valueOf(Math.abs(input.hashCode()));
+        }
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
     }
 }

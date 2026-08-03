@@ -60,7 +60,7 @@ public class MainActivity extends AppCompatActivity {
                 .decodeFormat(DecodeFormat.PREFER_ARGB_8888)
                 .diskCacheStrategy(DiskCacheStrategy.NONE)
                 .skipMemoryCache(true)
-                .watermarkRes("你好呀", Gravity.TOP | Gravity.START, 60, R.color.teal_700,30);
+                .watermarkRes("你好呀", Gravity.BOTTOM | Gravity.START, 60, R.color.teal_700,30);
 
         AesOption aesOpt = AesOption.create(key, iv);
 
