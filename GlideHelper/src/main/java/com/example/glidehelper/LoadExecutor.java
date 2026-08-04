@@ -21,7 +21,9 @@ import com.bumptech.glide.request.RequestListener;
 import com.bumptech.glide.request.RequestOptions;
 import com.bumptech.glide.request.target.Target;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.security.MessageDigest;
@@ -29,7 +31,6 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import javax.crypto.Cipher;
@@ -37,6 +38,7 @@ import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 import okhttp3.Call;
+import okhttp3.Callback;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -44,56 +46,40 @@ import okhttp3.ResponseBody;
 
 /**
  * ====================================================
- * LoadExecutor（OkHttp 最终修复版）
+ * LoadExecutor（同步 AesImageLoader 最终版）
  * ----------------------------------------------------
  *
- * 【必须依赖】
- *   implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+ * 按照 AesImageLoader 的成功模式重构：
+ *   ✅ 移除 isAttachedToWindow() 检查（RecyclerView 中过于严格）
+ *   ✅ OkHttp 异步 enqueue()，自定义线程池只负责解密
+ *   ✅ 缓存命中也提交到 AES_EXECUTOR，可被 cancel 中断
+ *   ✅ cancel 时同时取消 Call + Future
+ *   ✅ Glide.with(context) 加载 byte[]，不受 pauseRequests 影响
  *
- * 修复点：
- *   ✅ 修复 "Variable 'future' might not have been initialized"
- *      原因：Lambda finally 中通过闭包引用 future，编译器认为可能未初始化
- *      方案：finally 中改用 url 相等性判断清理 Tag，不再引用 future/call
- *
- * 核心特性：
- *   ✅ OkHttp Call.cancel() 真正关闭 Socket，彻底释放线程
- *   ✅ 子线程零 View 访问，主线程 Tag 双重校验防错乱
- *   ✅ 缓存文件名 = URL MD5 + Key MD5，永久命中不重复解密
- *   ✅ 自适应线程池（4~6 线程）
- *
- * 需要在 res/values/ids.xml 中定义：
- *   <item name="tag_aes_url" type="id"/>
- *   <item name="tag_aes_future" type="id"/>
- *   <item name="tag_aes_call" type="id"/>
- *
- * Adapter 中需要在 onViewRecycled 调用：
- *   LoadExecutor.cancelAndClear(holder.imageView);
- *
+ * 对外 API 完全不变，Adapter 无需修改
  * ====================================================
  */
 public class LoadExecutor {
 
     private static final String TAG = "LoadExecutor";
 
-    // ===================== 常量 =====================
-
     private static final long CACHE_MAX_AGE = 7L * 24 * 60 * 60 * 1000;
     private static final String AES_CACHE_PREFIX = "aes_";
     private static final String AES_CACHE_SUFFIX = ".cache";
 
     private static final int TAG_AES_URL = R.id.tag_aes_url;
-    private static final int TAG_AES_FUTURE = R.id.tag_aes_future;
     private static final int TAG_AES_CALL = R.id.tag_aes_call;
+    private static final int TAG_AES_FUTURE = R.id.tag_aes_future;
 
     // ===================== OkHttpClient =====================
 
     private static final OkHttpClient OK_HTTP_CLIENT = new OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
+            .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)
-            .writeTimeout(15, TimeUnit.SECONDS)
+            .writeTimeout(10, TimeUnit.SECONDS)
             .build();
 
-    // ===================== 线程池 =====================
+    // ===================== 线程池（只解密，不网络 IO）====================
 
     private static final ExecutorService AES_EXECUTOR;
 
@@ -103,8 +89,6 @@ public class LoadExecutor {
         AES_EXECUTOR = Executors.newFixedThreadPool(poolSize);
         Log.d(TAG, "AES Executor initialized, CPU cores=" + cores + ", pool=" + poolSize);
     }
-
-    // ===================== Handler =====================
 
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
 
@@ -136,7 +120,7 @@ public class LoadExecutor {
     }
 
     /**
-     * AES 图加载（OkHttp 版）
+     * AES 图加载（AesImageLoader 模式）
      */
     @SuppressLint("CheckResult")
     static void executeAesBitmap(
@@ -146,17 +130,39 @@ public class LoadExecutor {
             @NonNull LoadOption option,
             @NonNull AesOption aesOption
     ) {
-        // ===== Step 1: 主线程绑定 URL Tag =====
+        // 1. 绑定 URL Tag
         imageView.setTag(TAG_AES_URL, url);
+        Log.d(TAG, "开始加载: " + url);
 
-        // ===== Step 2: 取消旧任务（关闭旧 Socket + 中断旧线程） =====
+        // 2. 取消旧任务（Call + Future）
         cancelTask(imageView);
 
-        // ===== Step 3: 主线程预计算缓存路径 =====
+        // 3. 预计算缓存路径
         final File cacheDir = getCacheDir(context);
         final String cacheFileName = generateCacheFileName(url, aesOption);
+        final File cacheFile = new File(cacheDir, cacheFileName);
 
-        // ===== Step 4: 构建 OkHttp Request & Call =====
+        // 4. 缓存命中：提交到线程池读取，避免主线程 IO，同时可被 cancel
+        if (cacheFile.exists() && cacheFile.length() > 0) {
+            Log.d(TAG, "缓存命中: " + cacheFileName);
+            Future<?> future = AES_EXECUTOR.submit(() -> {
+                try {
+                    if (Thread.currentThread().isInterrupted()) return;
+                    byte[] data = readFileToBytes(cacheFile);
+                    postLoad(context, imageView, url, data, option);
+                } catch (Exception e) {
+                    Log.e(TAG, "缓存读取失败: " + url, e);
+                    cacheFile.delete();
+                    postError(imageView, url, option);
+                } finally {
+                    clearFutureTag(imageView, url);
+                }
+            });
+            imageView.setTag(TAG_AES_FUTURE, future);
+            return;
+        }
+
+        // 5. 构建 OkHttp 异步请求
         Request.Builder requestBuilder = new Request.Builder().url(url);
         Map<String, String> headers = option.getFinalHeaders();
         if (headers != null) {
@@ -166,147 +172,75 @@ public class LoadExecutor {
         }
         final Request request = requestBuilder.build();
         final Call call = OK_HTTP_CLIENT.newCall(request);
-
-        // [FIX] 将 Call 绑定到 View Tag，供 cancel 时使用
         imageView.setTag(TAG_AES_CALL, call);
 
-        // ===== Step 5: 提交到线程池 =====
-        try {
-            Future<?> future = AES_EXECUTOR.submit(() -> {
-                try {
-                    // [核心原则] 子线程中绝不访问 imageView！
+        // 6. 提交异步请求（网络 IO 由 OkHttp 处理，不阻塞 AES_EXECUTOR）
+        call.enqueue(new Callback() {
+            @Override
+            public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                if (call.isCanceled()) {
+                    Log.d(TAG, "Call 被取消: " + url);
+                    return;
+                }
+                Log.e(TAG, "网络请求失败: " + url, e);
+                postError(imageView, url, option);
+            }
 
-                    File cacheFile = new File(cacheDir, cacheFileName);
-                    final File validCacheFile;
+            @Override
+            public void onResponse(@NonNull Call call, @NonNull Response response) {
+                if (call.isCanceled()) {
+                    response.close();
+                    Log.d(TAG, "Call 已取消，丢弃响应: " + url);
+                    return;
+                }
 
-                    // 1. 检查本地缓存是否已存在
-                    if (cacheFile.exists() && cacheFile.length() > 0) {
-                        validCacheFile = cacheFile;
-                    } else {
-                        // 2. 同步执行网络请求
-                        Response response = call.execute();
+                if (!response.isSuccessful()) {
+                    response.close();
+                    Log.e(TAG, "HTTP 错误: " + response.code() + " for " + url);
+                    postError(imageView, url, option);
+                    return;
+                }
 
-                        if (call.isCanceled()) {
-                            Log.d(TAG, "Call 已被取消，中断任务: " + url);
-                            return;
-                        }
-
-                        if (!response.isSuccessful()) {
-                            throw new IOException("HTTP " + response.code() + " for " + url);
-                        }
-
+                // 7. 提交解密任务到 AES_EXECUTOR（纯 CPU）
+                Future<?> future = AES_EXECUTOR.submit(() -> {
+                    try {
                         ResponseBody body = response.body();
                         if (body == null) {
-                            throw new IOException("Response body is null: " + url);
+                            response.close();
+                            postError(imageView, url, option);
+                            return;
                         }
+
                         byte[] encrypted = body.bytes();
+                        response.close();
+                        Log.d(TAG, "下载完成: " + url + ", 大小=" + encrypted.length);
 
-                        // 3. 检查线程中断状态
-                        if (Thread.currentThread().isInterrupted()) {
-                            Log.d(TAG, "线程被中断，跳过解密: " + url);
+                        if (call.isCanceled() || Thread.currentThread().isInterrupted()) {
+                            Log.d(TAG, "下载完成后被取消，跳过解密: " + url);
                             return;
                         }
 
-                        // 4. 解密
+                        // 解密
                         byte[] decrypted = decrypt(encrypted, aesOption);
+                        Log.d(TAG, "解密完成: " + url + ", 大小=" + decrypted.length);
 
-                        // 5. 写入缓存文件
+                        // 写入缓存
                         writeCacheFile(cacheFile, decrypted);
-                        validCacheFile = cacheFile;
+
+                        // 主线程加载
+                        postLoad(context, imageView, url, decrypted, option);
+
+                    } catch (Exception e) {
+                        Log.e(TAG, "解密/缓存失败: " + url, e);
+                        postError(imageView, url, option);
+                    } finally {
+                        clearFutureTag(imageView, url);
                     }
+                });
 
-                    // 6. 回到主线程加载
-                    MAIN_HANDLER.post(() -> {
-                        // 主线程中校验 Tag
-                        Object currentTag = imageView.getTag(TAG_AES_URL);
-                        if (!url.equals(currentTag)) {
-                            Log.d(TAG, "View 已复用，丢弃结果: " + url);
-                            return;
-                        }
-
-                        if (!imageView.isAttachedToWindow()) {
-                            return;
-                        }
-
-                        // 先清除 Glide 旧请求，防止上一张图闪现
-                        Glide.with(imageView).clear(imageView);
-
-                        RequestOptions glideOptions = option.toRequestOptions();
-                        glideOptions.diskCacheStrategy(DiskCacheStrategy.NONE)
-                                .skipMemoryCache(false);
-
-                        Glide.with(imageView)
-                                .load(validCacheFile)
-                                .apply(glideOptions)
-                                .listener(new RequestListener<Drawable>() {
-                                    @Override
-                                    public boolean onLoadFailed(
-                                            @Nullable GlideException e,
-                                            Object model,
-                                            @NonNull Target<Drawable> target,
-                                            boolean isFirstResource) {
-                                        Log.e(TAG, "Glide 加载失败: " + url, e);
-                                        if (option.getErrorResId() != 0) {
-                                            imageView.setImageResource(option.getErrorResId());
-                                        }
-                                        return true;
-                                    }
-
-                                    @Override
-                                    public boolean onResourceReady(
-                                            @NonNull Drawable resource,
-                                            @NonNull Object model,
-                                            Target<Drawable> target,
-                                            @NonNull DataSource dataSource,
-                                            boolean isFirstResource) {
-                                        return false;
-                                    }
-                                })
-                                .into(imageView);
-                    });
-
-                } catch (IOException e) {
-                    if (call.isCanceled() || Thread.currentThread().isInterrupted()) {
-                        Log.d(TAG, "任务正常取消: " + url);
-                        return;
-                    }
-                    Log.e(TAG, "AES 网络/IO 错误: " + url, e);
-                    MAIN_HANDLER.post(() -> {
-                        Object currentTag = imageView.getTag(TAG_AES_URL);
-                        if (url.equals(currentTag) && option.getErrorResId() != 0) {
-                            imageView.setImageResource(option.getErrorResId());
-                        }
-                    });
-                } catch (Exception e) {
-                    Log.e(TAG, "AES 任务失败: " + url, e);
-                    MAIN_HANDLER.post(() -> {
-                        Object currentTag = imageView.getTag(TAG_AES_URL);
-                        if (url.equals(currentTag) && option.getErrorResId() != 0) {
-                            imageView.setImageResource(option.getErrorResId());
-                        }
-                    });
-                } finally {
-                    // [FIX] 不再引用 future/call，改用 url 相等性判断清理 Tag
-                    // 避免 "Variable 'future' might not have been initialized" 编译错误
-                    MAIN_HANDLER.post(() -> {
-                        Object currentUrl = imageView.getTag(TAG_AES_URL);
-                        if (url.equals(currentUrl)) {
-                            imageView.setTag(TAG_AES_CALL, null);
-                            imageView.setTag(TAG_AES_FUTURE, null);
-                        }
-                    });
-                }
-            });
-
-            // 绑定 Future 到 View Tag
-            imageView.setTag(TAG_AES_FUTURE, future);
-
-        } catch (RejectedExecutionException e) {
-            Log.e(TAG, "AES 线程池拒绝任务: " + url, e);
-            if (option.getErrorResId() != 0) {
-                imageView.setImageResource(option.getErrorResId());
+                imageView.setTag(TAG_AES_FUTURE, future);
             }
-        }
+        });
     }
 
     // ====================================================
@@ -319,8 +253,6 @@ public class LoadExecutor {
     public static void cancelAndClear(@NonNull ImageView imageView) {
         cancelTask(imageView);
         imageView.setTag(TAG_AES_URL, null);
-        imageView.setTag(TAG_AES_FUTURE, null);
-        imageView.setTag(TAG_AES_CALL, null);
         try {
             Glide.with(imageView).clear(imageView);
         } catch (Exception ignored) {
@@ -358,7 +290,7 @@ public class LoadExecutor {
     // ====================================================
 
     /**
-     * 取消 ImageView 上正在执行的任务
+     * 取消 ImageView 上正在执行的任务（Call + Future）
      */
     private static void cancelTask(@NonNull ImageView imageView) {
         Object callTag = imageView.getTag(TAG_AES_CALL);
@@ -370,6 +302,87 @@ public class LoadExecutor {
         if (futureTag instanceof Future) {
             ((Future<?>) futureTag).cancel(true);
         }
+
+        imageView.setTag(TAG_AES_CALL, null);
+        imageView.setTag(TAG_AES_FUTURE, null);
+    }
+
+    /**
+     * 主线程加载解密后的图片（移除 isAttachedToWindow 检查）
+     */
+    private static void postLoad(Context context, ImageView imageView, String url,
+                                 byte[] data, LoadOption option) {
+        MAIN_HANDLER.post(() -> {
+            // 只保留 Tag 校验，足够防止错乱
+            Object currentTag = imageView.getTag(TAG_AES_URL);
+            if (!url.equals(currentTag)) {
+                Log.d(TAG, "View 已复用，丢弃: " + url);
+                return;
+            }
+
+            // [关键修复] 不再检查 isAttachedToWindow()
+            // RecyclerView 滚动/动画期间此检查过于严格，会误杀正常加载
+
+            // 清除 Glide 旧请求
+            try {
+                Glide.with(imageView).clear(imageView);
+            } catch (Exception ignored) {
+            }
+
+            RequestOptions glideOptions = option.toRequestOptions();
+            glideOptions.diskCacheStrategy(DiskCacheStrategy.NONE)
+                    .skipMemoryCache(false);
+
+            Log.d(TAG, "提交 Glide 加载: " + url + ", bytes=" + data.length);
+
+            Glide.with(context)
+                    .load(data)
+                    .apply(glideOptions)
+                    .listener(new RequestListener<Drawable>() {
+                        @Override
+                        public boolean onLoadFailed(
+                                @Nullable GlideException e,
+                                Object model,
+                                @NonNull Target<Drawable> target,
+                                boolean isFirstResource) {
+                            Log.e(TAG, "❌ Glide 加载失败: " + url, e);
+                            if (option.getErrorResId() != 0) {
+                                imageView.setImageResource(option.getErrorResId());
+                            }
+                            return true;
+                        }
+
+                        @Override
+                        public boolean onResourceReady(
+                                @NonNull Drawable resource,
+                                @NonNull Object model,
+                                Target<Drawable> target,
+                                @NonNull DataSource dataSource,
+                                boolean isFirstResource) {
+                            Log.d(TAG, "✅ Glide 加载成功: " + url);
+                            return false;
+                        }
+                    })
+                    .into(imageView);
+        });
+    }
+
+    private static void postError(ImageView imageView, String url, LoadOption option) {
+        MAIN_HANDLER.post(() -> {
+            Object currentTag = imageView.getTag(TAG_AES_URL);
+            if (url.equals(currentTag) && option.getErrorResId() != 0) {
+                imageView.setImageResource(option.getErrorResId());
+            }
+        });
+    }
+
+    private static void clearFutureTag(ImageView imageView, String url) {
+        MAIN_HANDLER.post(() -> {
+            if (url.equals(imageView.getTag(TAG_AES_URL))) {
+                imageView.setTag(TAG_AES_FUTURE, null);
+                imageView.setTag(TAG_AES_CALL, null);
+            }
+        });
     }
 
     private static GlideUrl buildGlideUrl(String url, Map<String, String> headers) {
@@ -403,6 +416,24 @@ public class LoadExecutor {
             dir = context.getCacheDir();
         }
         return dir;
+    }
+
+    private static byte[] readFileToBytes(File file) throws IOException {
+        FileInputStream fis = null;
+        ByteArrayOutputStream bos = null;
+        try {
+            fis = new FileInputStream(file);
+            bos = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int len;
+            while ((len = fis.read(buf)) != -1) {
+                bos.write(buf, 0, len);
+            }
+            return bos.toByteArray();
+        } finally {
+            if (fis != null) fis.close();
+            if (bos != null) bos.close();
+        }
     }
 
     private static void writeCacheFile(File cacheFile, byte[] data) throws IOException {
