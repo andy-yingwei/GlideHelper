@@ -12,6 +12,7 @@ import androidx.annotation.DrawableRes;
 
 import com.bumptech.glide.load.DecodeFormat;
 import com.bumptech.glide.load.engine.DiskCacheStrategy;
+import com.bumptech.glide.load.resource.bitmap.CenterCrop;
 import com.bumptech.glide.load.resource.bitmap.CircleCrop;
 import com.bumptech.glide.load.resource.bitmap.RoundedCorners;
 import com.bumptech.glide.request.RequestOptions;
@@ -206,8 +207,11 @@ public class LoadOption {
     // ✅ 内部方法（LoadExecutor 用）
     // ============================
 
+
     /**
      * 获取最终用于网络请求的 Header（含 Cookie）
+     * [FIX] 移除错误的 Build.VERSION 判断
+     * Cookie 格式 key=value; key2=value2 在所有 Android 版本通用
      */
     Map<String, String> getFinalHeaders() {
         Map<String, String> result = new HashMap<>(headers);
@@ -215,10 +219,8 @@ public class LoadOption {
         if (!cookies.isEmpty()) {
             StringBuilder cookieBuilder = new StringBuilder();
             for (Map.Entry<String, String> entry : cookies.entrySet()) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-                    if (!cookieBuilder.isEmpty()) {
-                        cookieBuilder.append("; ");
-                    }
+                if (cookieBuilder.length() > 0) {
+                    cookieBuilder.append("; ");
                 }
                 cookieBuilder.append(entry.getKey())
                         .append("=")
@@ -237,7 +239,7 @@ public class LoadOption {
         if (errorResId != 0) options.error(errorResId);
 
         if (cornerRadius > 0) {
-            options.transform(new RoundedCorners(dp2px(cornerRadius)));
+            options.transform(new CenterCrop(), new RoundedCorners(dp2px(cornerRadius)));
         } else if (isCircleCrop) {
             options.transform(new CircleCrop());
         }

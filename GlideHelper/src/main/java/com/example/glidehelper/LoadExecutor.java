@@ -2,6 +2,7 @@ package com.example.glidehelper;
 
 import android.annotation.SuppressLint;
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.graphics.drawable.Drawable;
 import android.os.Handler;
 import android.os.Looper;
@@ -19,7 +20,9 @@ import com.bumptech.glide.load.model.GlideUrl;
 import com.bumptech.glide.load.model.LazyHeaders;
 import com.bumptech.glide.request.RequestListener;
 import com.bumptech.glide.request.RequestOptions;
+import com.bumptech.glide.request.target.CustomTarget;
 import com.bumptech.glide.request.target.Target;
+import com.bumptech.glide.request.transition.Transition;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -55,6 +58,10 @@ import okhttp3.ResponseBody;
  *   ✅ 缓存命中也提交到 AES_EXECUTOR，可被 cancel 中断
  *   ✅ cancel 时同时取消 Call + Future
  *   ✅ Glide.with(context) 加载 byte[]，不受 pauseRequests 影响
+ *
+ * [FIX] executeNormal() 增加 .asBitmap() + CustomTarget
+ *       解决服务器返回 Content-Type: binary/octet-stream 时
+ *       Glide 无法自动解码为 Bitmap 的问题
  *
  * 对外 API 完全不变，Adapter 无需修改
  * ====================================================
@@ -105,17 +112,57 @@ public class LoadExecutor {
         RequestOptions options = option.toRequestOptions();
         GlideUrl glideUrl = buildGlideUrl(url, option.getFinalHeaders());
 
+        // [FIX] 强制 asBitmap()，绕过服务器返回 binary/octet-stream 时
+        // Glide 因 Content-Type 不匹配而拒绝解码的问题
         if (option.getThumbnail() > 0f) {
             Glide.with(context)
+                    .asBitmap()
                     .load(glideUrl)
                     .thumbnail(option.getThumbnail())
                     .apply(options)
-                    .into(imageView);
+                    .into(new CustomTarget<Bitmap>() {
+                        @Override
+                        public void onResourceReady(@NonNull Bitmap bitmap, Transition<? super Bitmap> transition) {
+                            imageView.setImageBitmap(bitmap);
+                        }
+
+                        @Override
+                        public void onLoadCleared(@Nullable Drawable placeholder) {
+                            imageView.setImageDrawable(placeholder);
+                        }
+
+                        @Override
+                        public void onLoadFailed(@Nullable Drawable errorDrawable) {
+                            super.onLoadFailed(errorDrawable);
+                            if (option.getErrorResId() != 0) {
+                                imageView.setImageResource(option.getErrorResId());
+                            }
+                        }
+                    });
         } else {
             Glide.with(context)
+                    .asBitmap()
                     .load(glideUrl)
                     .apply(options)
-                    .into(imageView);
+                    .into(new CustomTarget<Bitmap>() {
+                        @Override
+                        public void onResourceReady(@NonNull Bitmap bitmap, Transition<? super Bitmap> transition) {
+                            imageView.setImageBitmap(bitmap);
+                        }
+
+                        @Override
+                        public void onLoadCleared(@Nullable Drawable placeholder) {
+                            imageView.setImageDrawable(placeholder);
+                        }
+
+                        @Override
+                        public void onLoadFailed(@Nullable Drawable errorDrawable) {
+                            super.onLoadFailed(errorDrawable);
+                            if (option.getErrorResId() != 0) {
+                                imageView.setImageResource(option.getErrorResId());
+                            }
+                        }
+                    });
         }
     }
 

@@ -14,7 +14,6 @@ import com.bumptech.glide.Glide;
  * recyclerView.addOnScrollListener(
  *         new GlideScrollListener()
  * );
-
  * ====================================================
  */
 public class GlideScrollListener extends RecyclerView.OnScrollListener {
@@ -23,12 +22,16 @@ public class GlideScrollListener extends RecyclerView.OnScrollListener {
     public void onScrollStateChanged(RecyclerView rv, int newState) {
         switch (newState) {
             case RecyclerView.SCROLL_STATE_IDLE:
-                // [IMPROVE] 使用 rv 而非 context，避免 Fragment 生命周期问题
+                // [FIX] 滚动停止后恢复加载
                 Glide.with(rv).resumeRequests();
                 break;
             case RecyclerView.SCROLL_STATE_DRAGGING:
-            case RecyclerView.SCROLL_STATE_SETTLING:
+                // [FIX] 手指拖拽时暂停，避免快速滑动浪费带宽
                 Glide.with(rv).pauseRequests();
+                break;
+            case RecyclerView.SCROLL_STATE_SETTLING:
+                // [FIX] 惯性滑动不暂停，否则快速滚动到底部时
+                // 最后几个可见 item 的图片永远不会加载
                 break;
         }
     }
